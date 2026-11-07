@@ -6,7 +6,22 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
-## [0.1.1]
+## [0.1.2] - 2026-11-07
+
+No code changes. This release is about packaging and docs.
+
+### Added
+
+- A publish workflow that runs on a GitHub release, runs the checks and tests, and publishes to JSR and npm with
+  provenance through GitHub OIDC, so no publish tokens are stored.
+
+### Changed
+
+- README: badges, a one-line summary of what the library is for, both import paths in the quick start, and a "Why not
+  airtable.js?" section.
+- npm keywords, and an explicit `publish.exclude` list in `deno.json`.
+
+## [0.1.1] - 2026-11-07
 
 ### Fixed
 
@@ -32,7 +47,7 @@ All notable changes to this project are listed here. The format follows
 - `new Outbox()` throws a `RangeError` if `leaseMs` is not longer than the client's `timeoutMs`.
 - `ProcessResult.requests` counts HTTP attempts, retries included.
 
-## [0.1.0]
+## [0.1.0] - 2026-11-07
 
 First release.
 
@@ -51,6 +66,7 @@ First release.
   migrations in `sql/`.
 - Supabase example with a scheduled Edge Function.
 
-[Unreleased]: https://github.com/munimh/airspool/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/munimh/airspool/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/munimh/airspool/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/munimh/airspool/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/munimh/airspool/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 {
   "name": "@munimh/airspool",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "MIT",
   "exports": "./mod.ts",
   "publish": {
@@ -12,7 +12,8 @@
       "LICENSE",
       "CHANGELOG.md",
       "SECURITY.md"
-    ]
+    ],
+    "exclude": ["tests/", "examples/", "scripts/", "dist/", "node_modules/", "*.tgz"]
   },
   "compilerOptions": {
     "strict": true,

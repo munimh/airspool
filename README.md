@@ -1,6 +1,15 @@
 # airspool
 
+[![JSR](https://jsr.io/badges/@munimh/airspool)](https://jsr.io/@munimh/airspool)
+[![JSR score](https://jsr.io/badges/@munimh/airspool/score)](https://jsr.io/@munimh/airspool/score)
+[![npm](https://img.shields.io/npm/v/airspool)](https://www.npmjs.com/package/airspool)
+[![License: MIT](https://img.shields.io/github/license/munimh/airspool)](LICENSE)
+[![CI](https://github.com/munimh/airspool/actions/workflows/ci.yml/badge.svg)](https://github.com/munimh/airspool/actions/workflows/ci.yml)
+
 Reliable Airtable writes from a backend.
+
+An Airtable API client for Node and Deno that handles the 5 requests per second rate limit and 429 errors, with a queue
+for writes that must not be lost.
 
 - **A rate-limited client.** Built on `fetch` with no runtime dependencies. Requests from every caller in the process
   share one pacer, so together they stay under Airtable's per-base and per-token limits. Writes are split into the
@@ -21,7 +30,8 @@ npm install airspool            # Node, Bun, Workers
 ## Quick start
 
 ```ts
-import { AirtableClient, Outbox, postgresStore } from "@munimh/airspool"; // npm: "airspool"
+import { AirtableClient, Outbox, postgresStore } from "airspool"; // Node, Bun, Workers (npm install airspool)
+// import { AirtableClient, Outbox, postgresStore } from "@munimh/airspool"; // Deno (deno add jsr:@munimh/airspool)
 import postgres from "postgres";
 
 const sql = postgres(process.env.DATABASE_URL!);
@@ -82,6 +92,15 @@ await sql.begin(async (tx) => {
   await outbox.withStore(txStore).enqueue({ baseId, table: "Orders", recordId, fields: { Status: "Shipped" } });
 });
 ```
+
+## Why not airtable.js?
+
+[airtable.js](https://github.com/airtable/airtable.js) is Airtable's official client. In its current npm release
+(0.12.2; see `lib/base.js` and `lib/internal_config.json`), every request is sent as soon as you make it, with no pacing
+across callers, so concurrent calls run into the 5 requests per second limit and come back as 429s. A 429 is retried
+after a random wait of up to 5 seconds that doubles each time up to 10 minutes, with no limit on the number of tries,
+instead of the 30 seconds Airtable documents. Server errors and network errors are not retried, and there is no queue: a
+write that fails while Airtable is down is lost unless your own code keeps it.
 
 ## The client
 

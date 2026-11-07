@@ -1,6 +1,6 @@
 {
   "name": "airspool",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Reliable Airtable writes from a backend: a rate-limited fetch client and a durable outbox that queues, merges and retries.",
   "license": "MIT",
   "author": "Hussain Munim",
@@ -9,14 +9,19 @@
   "bugs": { "url": "https://github.com/munimh/airspool/issues" },
   "keywords": [
     "airtable",
+    "airtable api",
+    "rate limit",
     "outbox",
-    "rate-limit",
-    "queue",
+    "transactional outbox",
     "retry",
-    "postgres",
+    "queue",
     "supabase",
+    "postgres",
+    "sqlite",
     "deno",
-    "cloudflare-workers"
+    "bun",
+    "cloudflare-workers",
+    "typescript"
   ],
   "type": "module",
   "engines": { "node": ">=18" },
