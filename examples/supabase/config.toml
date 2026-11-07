@@ -1,0 +1,7 @@
+# Add these sections to your project's supabase/config.toml.
+# The processor checks its own secret, so it does not need a Supabase JWT.
+[functions.airspool-process]
+verify_jwt = false
+
+[functions.send-reminder]
+verify_jwt = true

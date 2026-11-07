@@ -1,0 +1,44 @@
+{
+  "name": "airspool",
+  "version": "0.1.0",
+  "description": "Reliable Airtable writes from a backend: a rate-limited fetch client and a durable outbox that queues, merges and retries.",
+  "license": "MIT",
+  "author": "Hussain Munim",
+  "repository": { "type": "git", "url": "git+https://github.com/munimh/airspool.git" },
+  "homepage": "https://github.com/munimh/airspool#readme",
+  "bugs": { "url": "https://github.com/munimh/airspool/issues" },
+  "keywords": [
+    "airtable",
+    "outbox",
+    "rate-limit",
+    "queue",
+    "retry",
+    "postgres",
+    "supabase",
+    "deno",
+    "cloudflare-workers"
+  ],
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/mod.d.ts",
+      "import": "./dist/mod.js"
+    },
+    "./sql/postgres.sql": "./sql/postgres.sql",
+    "./sql/sqlite.sql": "./sql/sqlite.sql",
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/mod.js",
+  "types": "./dist/mod.d.ts",
+  "files": ["dist", "sql", "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md"],
+  "scripts": {
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.npm.json && node scripts/fix_dts.mjs",
+    "test:node": "node scripts/node_smoke.mjs",
+    "prepublishOnly": "npm run build && npm run test:node"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3"
+  }
+}
