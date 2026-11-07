@@ -52,7 +52,15 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno publish
+      # Skipped when this version is already on JSR, so re-running a failed run is safe.
+      - name: Publish to JSR
+        run: |
+          version=$(jq -r .version deno.json)
+          if curl -sf https://jsr.io/@munimh/airspool/meta.json | jq -e --arg v "$version" '.versions[$v]' > /dev/null; then
+            echo "@munimh/airspool@$version is already on JSR; nothing to do."
+            exit 0
+          fi
+          deno publish
 
   npm:
     needs: check
@@ -67,4 +75,24 @@ jobs:
       - run: npm install -g npm@^11.19.0
       - run: npm ci
       # prepublishOnly builds the package and runs the Node check first.
-      - run: npm stage publish --provenance --access public
+      # Skipped when this version is already published. Retried when Sigstore answers
+      # 409 to npm's own retried upload (https://github.com/npm/cli/issues/10078):
+      # npm stops before staging then, and a new attempt signs with a new key.
+      - name: Stage on npm
+        run: |
+          set -o pipefail
+          version=$(jq -r .version package.json)
+          if npm view "airspool@$version" version > /dev/null 2>&1; then
+            echo "airspool@$version is already on npm; nothing to do."
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if npm stage publish --provenance --access public 2>&1 | tee npm-stage.log; then
+              exit 0
+            fi
+            if ! grep -q TLOG_CREATE_ENTRY_ERROR npm-stage.log || [ "$attempt" = 3 ]; then
+              exit 1
+            fi
+            echo "::warning::Sigstore rejected the provenance upload (attempt $attempt); retrying in 30 s."
+            sleep 30
+          done

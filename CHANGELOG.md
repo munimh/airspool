@@ -6,6 +6,11 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The publish workflow skips a registry that already has the version, so a failed run can be re-run, and retries npm
+  staging up to three times when Sigstore answers 409 to npm's own retried provenance upload.
+
 ## [0.1.2] - 2026-11-07
 
 No code changes. This release is about packaging and docs.
