@@ -19,7 +19,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: The release tag matches deno.json and package.json
         env:
           TAG: ${{ github.event.release.tag_name }}
@@ -36,9 +36,10 @@ jobs:
       - run: deno task check
       - run: deno task test
       - run: deno publish --dry-run
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
+          package-manager-cache: false # no shared cache in a release build
       - run: npm ci
       - run: npm run build
       - run: npm run test:node
@@ -48,7 +49,7 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
@@ -66,11 +67,12 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       # Staged publishing needs a recent npm 11.
       - run: npm install -g npm@^11.19.0
       - run: npm ci
