@@ -58,12 +58,24 @@ export interface AirtableClientOptions {
   rateLimitPauseMs?: number;
   /** First backoff delay for network and 5xx retries. @default 500 */
   retryBaseDelayMs?: number;
-  /** Largest backoff delay for network and 5xx retries. @default 8000 */
+  /**
+   * Largest backoff delay for network and 5xx retries. A `Retry-After`
+   * longer than this is not waited for: the request fails at once with a
+   * retryable {@link AirtableServerError}, so the caller (or the outbox)
+   * can try again later instead of blocking.
+   * @default 8000
+   */
   retryMaxDelayMs?: number;
   /** Abort a request that takes longer than this. `0` disables. @default 30000 */
   timeoutMs?: number;
   /** Random source for backoff jitter, in [0, 1). @default Math.random */
   random?: () => number;
+  /**
+   * Called before every HTTP attempt, after the rate-limit wait and before
+   * `fetch`. If it throws, the request stops with that error and nothing is
+   * sent. The outbox uses it to renew its lease and check its time limit.
+   */
+  beforeAttempt?: () => void | Promise<void>;
 }
 
 /** Options shared by create, update and upsert. */
@@ -144,7 +156,7 @@ export interface ListOptions extends GetOptions {
 /** Airtable rejects URLs of 16,000 characters or more; past this we POST instead. */
 const MAX_URL_LENGTH = 15_000;
 
-const tokens = new WeakMap<AirtableClient, { token: string; key: string }>();
+const tokens = new WeakMap<AirtableClient, { token: string; key: string; options: AirtableClientOptions }>();
 
 /** A short, non-reversible key for a token, used to share a rate limit lane. */
 function tokenFingerprint(token: string): string {
@@ -176,13 +188,22 @@ function chunk<T>(items: readonly T[], size: number): T[][] {
   return out;
 }
 
-function retryAfterMs(response: Response): number | undefined {
+function retryAfterMs(response: Response, now: number): number | undefined {
   const header = response.headers.get("retry-after");
   if (!header) return undefined;
   const seconds = Number(header);
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
   const date = Date.parse(header);
-  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
+  return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
+}
+
+/** The `records` array of a write answer, or a retryable error if it is missing. */
+function recordsOf<T>(body: unknown): T[] {
+  const records = (body as { records?: unknown } | null)?.records;
+  if (!Array.isArray(records)) {
+    throw new AirtableServerError(200, "Airtable answered without a records list");
+  }
+  return records as T[];
 }
 
 async function readError(response: Response): Promise<{ type?: string; airtableMessage?: string }> {
@@ -235,6 +256,7 @@ export class AirtableClient {
   readonly #retryMaxDelayMs: number;
   readonly #timeoutMs: number;
   readonly #random: () => number;
+  readonly #beforeAttempt: (() => void | Promise<void>) | undefined;
 
   /**
    * Create a client.
@@ -245,7 +267,7 @@ export class AirtableClient {
     if (typeof options.token !== "string" || options.token.trim() === "") {
       throw new TypeError("AirtableClient needs a token");
     }
-    tokens.set(this, { token: options.token, key: tokenFingerprint(options.token) });
+    tokens.set(this, { token: options.token, key: tokenFingerprint(options.token), options: { ...options } });
     this.#fetch = options.fetch ?? ((input, init) => fetch(input, init));
     this.#clock = options.clock ?? systemClock;
     this.#limiter = options.rateLimiter ?? sharedRateLimiter;
@@ -261,6 +283,29 @@ export class AirtableClient {
     this.#retryMaxDelayMs = options.retryMaxDelayMs ?? 8_000;
     this.#timeoutMs = options.timeoutMs ?? 30_000;
     this.#random = options.random ?? Math.random;
+    this.#beforeAttempt = options.beforeAttempt;
+  }
+
+  /** Per-attempt timeout in milliseconds; `0` means none. */
+  get timeoutMs(): number {
+    return this.#timeoutMs;
+  }
+
+  /**
+   * A client with the same token, `fetch`, clock and rate limiter, and some
+   * options changed. Both clients share rate-limit lanes.
+   *
+   * @param overrides Options to change. The token cannot be changed.
+   */
+  withOptions(overrides: Omit<Partial<AirtableClientOptions>, "token">): AirtableClient {
+    const secret = tokens.get(this);
+    if (!secret) throw new TypeError("client is not initialised");
+    return new AirtableClient({
+      ...secret.options,
+      rateLimiter: this.#limiter,
+      ...overrides,
+      token: secret.token,
+    });
   }
 
   /**
@@ -304,6 +349,7 @@ export class AirtableClient {
 
     while (true) {
       await this.#limiter.take(baseId, secret.key);
+      await this.#beforeAttempt?.();
 
       let response: Response;
       const controller = new AbortController();
@@ -345,11 +391,13 @@ export class AirtableClient {
         }
 
         if (response.status >= 500) {
-          const wait = retryAfterMs(response);
+          const wait = retryAfterMs(response, this.#clock.now());
           const details = await readError(response);
           // Airtable says 502 and 503 are safe to retry even for a create.
           const safe = spec.idempotent || response.status === 502 || response.status === 503;
-          if (safe && failures < this.#maxRetries) {
+          // Waiting longer than our own largest backoff would block the caller; let it retry later.
+          const tooLong = wait !== undefined && wait > this.#retryMaxDelayMs;
+          if (safe && !tooLong && failures < this.#maxRetries) {
             await this.#clock.sleep(wait ?? this.#backoff(failures));
             failures++;
             continue;
@@ -361,6 +409,11 @@ export class AirtableClient {
         throw new AirtableRequestError(response.status, describe(response.status, details), details);
       } catch (error) {
         if (error instanceof AirtableApiError) throw error;
+        // The answer was cut off or could not be parsed. Safe to ask again if idempotent.
+        if (spec.idempotent && failures < this.#maxRetries) {
+          await this.#clock.sleep(this.#backoff(failures++));
+          continue;
+        }
         throw new AirtableNetworkError(
           `Could not read Airtable's answer: ${error instanceof Error ? error.message : String(error)}`,
           error,
@@ -419,8 +472,8 @@ export class AirtableTable<F extends FieldValues = FieldValues> {
         path: this.#path,
         body: { records: part.map((r) => ({ fields: r.fields })), ...(options.typecast ? { typecast: true } : {}) },
         idempotent: false,
-      }) as { records: AirtableRecord<F>[] };
-      out.push(...body.records);
+      });
+      out.push(...recordsOf<AirtableRecord<F>>(body));
     }
     return out;
   }
@@ -446,8 +499,8 @@ export class AirtableTable<F extends FieldValues = FieldValues> {
           ...(options.typecast ? { typecast: true } : {}),
         },
         idempotent: true,
-      }) as { records: AirtableRecord<F>[] };
-      out.push(...body.records);
+      });
+      out.push(...recordsOf<AirtableRecord<F>>(body));
     }
     return out;
   }
@@ -478,7 +531,7 @@ export class AirtableTable<F extends FieldValues = FieldValues> {
         },
         idempotent: true,
       }) as Partial<UpsertResult<F>>;
-      result.records.push(...(body.records ?? []));
+      result.records.push(...recordsOf<AirtableRecord<F>>(body));
       result.createdRecords.push(...(body.createdRecords ?? []));
       result.updatedRecords.push(...(body.updatedRecords ?? []));
     }
@@ -501,8 +554,8 @@ export class AirtableTable<F extends FieldValues = FieldValues> {
         path: this.#path,
         query,
         idempotent: true,
-      }) as { records: { id: string; deleted: boolean }[] };
-      out.push(...body.records.filter((r) => r.deleted).map((r) => r.id));
+      });
+      out.push(...recordsOf<{ id: string; deleted: boolean }>(body).filter((r) => r.deleted).map((r) => r.id));
     }
     return out;
   }

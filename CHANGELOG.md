@@ -6,6 +6,32 @@ All notable changes to this project are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+
+- Requests that were already queued in the rate limiter when a 429 arrived went out during the 30-second pause. They now
+  wait it out too.
+- A long `Retry-After` on a 5xx answer was waited for in full. Anything longer than `retryMaxDelayMs` now fails at once
+  with a retryable `AirtableServerError`.
+- The outbox renewed its lease only before each request, so a client retry could go out after another worker had taken
+  over and overwrite a newer value. The lease is now renewed before every HTTP attempt.
+- `timeLimitMs` was only checked between requests. It is now checked before every attempt, and the outbox no longer lets
+  the client sit out 429 pauses itself.
+- A 2xx answer whose body could not be read is retried for idempotent requests, and a write answer without `records` is
+  an `AirtableServerError` instead of a `TypeError`.
+
+### Added
+
+- `beforeAttempt` client option, and `client.withOptions()`.
+- `clientRetries` outbox option (default `{ maxRetries: 1, maxRateLimitRetries: 0 }`).
+- `client.timeoutMs` getter.
+
+### Changed
+
+- `new Outbox()` throws a `RangeError` if `leaseMs` is not longer than the client's `timeoutMs`.
+- `ProcessResult.requests` counts HTTP attempts, retries included.
+
 ## [0.1.0]
 
 First release.
@@ -25,5 +51,6 @@ First release.
   migrations in `sql/`.
 - Supabase example with a scheduled Edge Function.
 
-[Unreleased]: https://github.com/munimh/airspool/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/munimh/airspool/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/munimh/airspool/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/munimh/airspool/releases/tag/v0.1.0

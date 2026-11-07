@@ -317,3 +317,86 @@ Deno.test("constructor checks its options", () => {
   }
   assert(threw);
 });
+
+Deno.test("callers already queued when a 429 arrives wait out the pause too", async () => {
+  const { clock, fake, client } = setup();
+  fake.seed(BASE, "Tasks", "recTASK000000001", {});
+  fake.script.push(errorResponse(429, "RATE_LIMIT_REACHED", "Rate limit exceeded"));
+  const calls = Array.from({ length: 6 }, () => client.table(BASE, "Tasks").get("recTASK000000001"));
+  await clock.run(Promise.all(calls));
+  const [limited, ...rest] = fake.requests;
+  assertEquals(rest.length, 6);
+  for (const r of rest) {
+    assert(r.at - limited!.at >= 30_000, `a request went out ${r.at - limited!.at} ms after the 429`);
+  }
+  assert(busiestSecond(rest, BASE) <= 5);
+});
+
+Deno.test("a Retry-After longer than retryMaxDelayMs is not waited for", async () => {
+  const { clock, fake, client } = setup();
+  fake.script.push(json(503, { error: { type: "RETRIABLE_ERROR" } }, { "retry-after": "120" }));
+  const error = await clock.run(client.table(BASE, "Tasks").get("recTASK000000001").catch((e) => e));
+  assertInstanceOf(error, AirtableServerError);
+  assert(error.retryable);
+  assertEquals(fake.requests.length, 1);
+});
+
+Deno.test("an answer that cannot be read is retried for reads and updates, not for creates", async () => {
+  const { clock, fake, client } = setup();
+  fake.seed(BASE, "Tasks", "recTASK000000001", { Name: "A" });
+  fake.script.push(new Response("{not json", { status: 200 }));
+  const rec = await clock.run(client.table(BASE, "Tasks").get("recTASK000000001"));
+  assertEquals(rec.fields.Name, "A");
+  assertEquals(fake.requests.length, 2);
+
+  fake.requests.length = 0;
+  fake.script.push(new Response("{not json", { status: 200 }));
+  const error = await clock.run(client.table(BASE, "Tasks").create([{ fields: {} }]).catch((e) => e));
+  assertInstanceOf(error, AirtableNetworkError);
+  assertEquals(fake.requests.length, 1);
+});
+
+Deno.test("a write answer without records is a retryable error, not a TypeError", async () => {
+  const { clock, fake, client } = setup({ maxRetries: 0 });
+  fake.script.push(json(200, {}));
+  const error = await clock.run(
+    client.table(BASE, "Tasks").update([{ id: "recTASK000000001", fields: { Name: "A" } }]).catch((e) => e),
+  );
+  assertInstanceOf(error, AirtableServerError);
+  assert(error.retryable);
+});
+
+Deno.test("beforeAttempt runs before every attempt and can stop the request", async () => {
+  const { clock, fake, make } = setup();
+  fake.seed(BASE, "Tasks", "recTASK000000001", {});
+  let calls = 0;
+  const counted = make().withOptions({ beforeAttempt: () => void calls++ });
+  fake.script.push(errorResponse(503, "RETRIABLE_ERROR"));
+  await clock.run(counted.table(BASE, "Tasks").get("recTASK000000001"));
+  assertEquals(calls, 2);
+  assertEquals(fake.requests.length, 2);
+
+  fake.requests.length = 0;
+  const stopped = make().withOptions({
+    beforeAttempt: () => {
+      throw new Error("stop here");
+    },
+  });
+  const error = await clock.run(stopped.table(BASE, "Tasks").get("recTASK000000001").catch((e) => e));
+  assertEquals((error as Error).message, "stop here");
+  assertEquals(fake.requests.length, 0);
+});
+
+Deno.test("withOptions keeps the token and shares the rate limiter", async () => {
+  const { clock, fake, client } = setup();
+  fake.seed(BASE, "Tasks", "recTASK000000001", {});
+  const other = client.withOptions({ maxRetries: 0 });
+  assert(!JSON.stringify(other).includes(TEST_TOKEN));
+  const calls = Array.from(
+    { length: 12 },
+    (_, i) => (i % 2 ? other : client).table(BASE, "Tasks").get("recTASK000000001"),
+  );
+  await clock.run(Promise.all(calls));
+  assertEquals(fake.violations.length, 0, "the two clients must share one lane");
+  assert(busiestSecond(fake.requests, BASE) <= 5);
+});

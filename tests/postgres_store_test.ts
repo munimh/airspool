@@ -30,7 +30,7 @@ Deno.test({
     sql ??= postgres(url!, { max: 10, onnotice: () => {} });
     const schema = `airspool_schema_${Date.now()}`;
     await sql.unsafe(`CREATE SCHEMA ${schema}`);
-    await sql.begin(async (tx) => {
+    await sql.begin(async (tx: { unsafe: (query: string) => PromiseLike<unknown> }) => {
       await tx.unsafe(`SET LOCAL search_path TO ${schema}`);
       await tx.unsafe(POSTGRES_SCHEMA);
       await tx.unsafe(POSTGRES_SCHEMA); // twice: it must be safe to rerun

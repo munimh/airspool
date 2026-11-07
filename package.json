@@ -1,6 +1,6 @@
 {
   "name": "airspool",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Reliable Airtable writes from a backend: a rate-limited fetch client and a durable outbox that queues, merges and retries.",
   "license": "MIT",
   "author": "Hussain Munim",

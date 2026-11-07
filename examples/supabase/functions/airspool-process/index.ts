@@ -8,7 +8,8 @@ Deno.serve(async (req) => {
   if (!secret || req.headers.get("authorization") !== `Bearer ${secret}`) {
     return new Response("Unauthorized", { status: 401 });
   }
-  // Stay well inside the function's wall-clock limit.
+  // Stay well inside the function's wall-clock limit: a run can overrun the
+  // time limit by one request timeout plus one 30-second rate-limit pause.
   const result = await outbox.process({ timeLimitMs: 50_000 });
   return Response.json({ ...result, queue: await outbox.status() });
 });

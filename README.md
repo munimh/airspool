@@ -128,8 +128,8 @@ one processor sends at a time.
 
 After a 429 Airtable rejects further requests for a while; the
 [docs](https://airtable.com/developers/web/api/rate-limits) say to wait 30 seconds. The client pauses that base's lane
-for `rateLimitPauseMs` (30 s), which holds back every caller on it, then tries again, up to `maxRateLimitRetries` (2)
-times.
+for `rateLimitPauseMs` (30 s). Every caller on that base waits out the pause, including requests that were already
+queued when the 429 arrived, then the client tries again, up to `maxRateLimitRetries` (2) times.
 
 Airtable also has monthly API call allowances that depend on your plan; see
 [Managing API call limits](https://support.airtable.com/articles/7735693959-managing-api-call-limits-in-airtable).
@@ -140,12 +140,12 @@ Batching and the outbox's merging both reduce how many calls you use.
 Every error the client throws is an `AirtableApiError` with `kind`, `status`, `type` (Airtable's error type, such as
 `INVALID_REQUEST_UNKNOWN` or `INVALID_PERMISSIONS_OR_MODEL_NOT_FOUND`), `airtableMessage` and `retryable`.
 
-| Answer                                  | Class                    | Retried by the client                                  | Outbox               |
-| --------------------------------------- | ------------------------ | ------------------------------------------------------ | -------------------- |
-| 400, 401, 403, 404, 413, 422, other 4xx | `AirtableRequestError`   | No: the request was wrong                              | Fails at once        |
-| 429                                     | `AirtableRateLimitError` | After 30 s, up to 2 times                              | Retries with backoff |
-| 500, 502, 503, 504                      | `AirtableServerError`    | Up to 3 times, jittered backoff; honours `Retry-After` | Retries with backoff |
-| No answer (network error, timeout)      | `AirtableNetworkError`   | Up to 3 times, jittered backoff                        | Retries with backoff |
+| Answer                                  | Class                    | Retried by the client                                                          | Outbox               |
+| --------------------------------------- | ------------------------ | ------------------------------------------------------------------------------ | -------------------- |
+| 400, 401, 403, 404, 413, 422, other 4xx | `AirtableRequestError`   | No: the request was wrong                                                      | Fails at once        |
+| 429                                     | `AirtableRateLimitError` | After 30 s, up to 2 times                                                      | Retries with backoff |
+| 500, 502, 503, 504                      | `AirtableServerError`    | Up to 3 times, jittered backoff; honours `Retry-After` up to `retryMaxDelayMs` | Retries with backoff |
+| No answer (network error, timeout)      | `AirtableNetworkError`   | Up to 3 times, jittered backoff                                                | Retries with backoff |
 
 Errors are classified by HTTP status, following Airtable's
 [error reference](https://airtable.com/developers/web/api/errors), so an error type Airtable adds later is handled too.
@@ -156,7 +156,16 @@ A create is not idempotent: if the answer is lost, the record may exist already.
 deletes and reads are retried in all those cases.
 
 Backoff is "full jitter": a random wait between 0 and `retryBaseDelayMs * 2^n` (500 ms, 1 s, 2 s, ... at most
-`retryMaxDelayMs`, 8 s).
+`retryMaxDelayMs`, 8 s). A `Retry-After` header longer than `retryMaxDelayMs` is not waited for: the request fails at
+once with a retryable `AirtableServerError`, so a long server hint cannot block your process. An answer whose body
+cannot be read is retried like a network error.
+
+Two options help when you build on the client:
+
+- `beforeAttempt` is called before every HTTP attempt, after the rate-limit wait. Throwing from it stops the request
+  without sending anything.
+- `client.withOptions({ ... })` returns a client with some options changed that keeps the same token and shares the same
+  rate-limit lanes.
 
 ### The token
 
@@ -172,7 +181,8 @@ const outbox = new Outbox({
   queue: "default", // several queues can share one store
   maxAttempts: 5, // then the change is marked failed
   backoff: (attempt) => Math.min(60_000 * 2 ** (attempt - 1), 3_600_000), // 1, 2, 4, 8 ... min (the default)
-  leaseMs: 120_000,
+  leaseMs: 120_000, // must be longer than the client's timeoutMs
+  clientRetries: { maxRetries: 1, maxRateLimitRetries: 0 }, // the default; see below
   onSent: (e) => console.log("sent", e.table, e.recordId, e.changes.length),
   onFailed: (e) => e.willRetry || alertSomeone(e),
 });
@@ -210,9 +220,15 @@ const result = await outbox.process({ timeLimitMs: 50_000 });
 // { ran: true, written: 12, sent: 30, retrying: 1, failed: 0, requests: 2 }
 ```
 
-If another worker holds the lease, `process()` returns `{ ran: false }` at once. The lease is renewed before every
-request; a worker that dies stops renewing it, and after `leaseMs` another worker takes over. A worker that finds its
-lease taken stops before its next request.
+If another worker holds the lease, `process()` returns `{ ran: false }` at once. The lease is renewed right before every
+HTTP attempt, retries included, so a worker that lost its lease can never send an old value after another worker sent a
+newer one. A worker that dies stops renewing, and after `leaseMs` another worker takes over. `leaseMs` must be longer
+than the client's `timeoutMs`, which bounds one attempt; the constructor checks this.
+
+While sending, the outbox runs the client with `clientRetries` (by default one quick retry for network errors and 5xx,
+and no waiting out 429s). The outbox's own backoff handles longer outages, and runs stay short. `timeLimitMs` is checked
+before every attempt; a run can still overrun it by one attempt (`timeoutMs`) plus one rate-limit pause, so leave that
+much room below a hard deadline.
 
 If Airtable refuses a batch as invalid, the outbox sends its records one at a time to find the bad one, so one bad
 record does not hold back the other nine.

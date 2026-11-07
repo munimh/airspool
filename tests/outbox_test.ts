@@ -15,7 +15,9 @@ import { errorResponse, json, MockAirtable, TEST_TOKEN } from "./mock_airtable.t
 const BASE = "appTESTBASE000001";
 const MINUTE = 60_000;
 
-function setup(options: Partial<OutboxOptions> & { maxRetries?: number; store?: OutboxStore } = {}) {
+function setup(
+  options: Partial<OutboxOptions> & { maxRetries?: number; timeoutMs?: number; store?: OutboxStore } = {},
+) {
   const clock = new FakeClock();
   const fake = new MockAirtable({
     clock,
@@ -29,6 +31,7 @@ function setup(options: Partial<OutboxOptions> & { maxRetries?: number; store?: 
     rateLimiter: limiter,
     random: () => 0,
     maxRetries: options.maxRetries ?? 0,
+    timeoutMs: options.timeoutMs,
   });
   const store = options.store ?? memoryStore();
   const sent: SentEvent[] = [];
@@ -207,7 +210,7 @@ Deno.test("temporary errors retry after 1, 2, 4, 8 minutes, then fail after max 
 });
 
 Deno.test("maxAttempts and backoff are configurable", async () => {
-  const { clock, fake, outbox } = setup({ maxAttempts: 2, backoff: () => 5_000 });
+  const { clock, fake, outbox } = setup({ maxAttempts: 2, backoff: () => 5_000, clientRetries: { maxRetries: 0 } });
   fake.intercept = () => errorResponse(502, "BAD_GATEWAY");
   await outbox.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Done" } });
   await clock.run(outbox.process());
@@ -221,7 +224,7 @@ Deno.test("maxAttempts and backoff are configurable", async () => {
 });
 
 Deno.test("a new change for a record that is backing off waits with it", async () => {
-  const { clock, fake, outbox } = setup();
+  const { clock, fake, outbox } = setup({ clientRetries: { maxRetries: 0 } });
   fake.seed(BASE, "Tasks", task(1), {});
   fake.script.push(errorResponse(503, "RETRIABLE_ERROR"));
   await outbox.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Open" } });
@@ -322,9 +325,9 @@ Deno.test("two processors racing: only one runs", async () => {
 
 Deno.test("a worker that dies mid-run loses its lease, and another takes over", async () => {
   const shared = memoryStore();
-  const crashed = setup({ store: shared, leaseMs: 30_000 });
+  const crashed = setup({ store: shared, leaseMs: 30_000, timeoutMs: 5_000 });
   crashed.fake.intercept = () => () => new Promise<Response>(() => {}); // never answers
-  const live = setup({ store: shared, leaseMs: 30_000 });
+  const live = setup({ store: shared, leaseMs: 30_000, timeoutMs: 5_000 });
   live.fake.seed(BASE, "Tasks", task(1), {});
   await crashed.outbox.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Done" } });
 
@@ -350,6 +353,7 @@ Deno.test("a worker whose lease was taken stops before its next request", async 
     fetch: fake.fetch,
     clock,
     rateLimiter: new RateLimiter({ clock }),
+    timeoutMs: 5_000,
   });
   const slow = new Outbox({ store: shared, client, clock, leaseMs: 10_000 });
   const quick = new Outbox({ store: shared, client, clock, leaseMs: 10_000 });
@@ -458,4 +462,71 @@ Deno.test("upsert answers carry the record id into onSent even when Airtable sen
   await clock.run(outbox.process());
   assertEquals(sent[0]!.recordId, task(9));
   assertEquals(sent[0]!.created, false);
+});
+
+Deno.test("leaseMs must be longer than the client's timeoutMs", () => {
+  const client = new AirtableClient({ token: TEST_TOKEN, timeoutMs: 30_000 });
+  let error: unknown;
+  try {
+    new Outbox({ store: memoryStore(), client, leaseMs: 30_000 });
+  } catch (e) {
+    error = e;
+  }
+  assert(error instanceof RangeError);
+  new Outbox({ store: memoryStore(), client, leaseMs: 30_001 });
+});
+
+Deno.test("a worker that lost its lease does not retry a request afterwards", async () => {
+  const shared = memoryStore();
+  const clock = new FakeClock();
+  const fake = new MockAirtable({ clock });
+  fake.seed(BASE, "Tasks", task(1), {});
+  const client = new AirtableClient({
+    token: TEST_TOKEN,
+    fetch: fake.fetch,
+    clock,
+    rateLimiter: new RateLimiter({ clock }),
+    timeoutMs: 5_000,
+    random: () => 0,
+  });
+  const slow = new Outbox({ store: shared, client, clock, leaseMs: 10_000 });
+  const quick = new Outbox({ store: shared, client, clock, leaseMs: 10_000 });
+  await slow.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Open" } });
+
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  fake.intercept = async () => {
+    fake.intercept = undefined;
+    await gate;
+    return errorResponse(503, "RETRIABLE_ERROR"); // the slow worker's first try fails late
+  };
+  const slowRun = slow.process();
+  await flush();
+  await clock.advance(10_001);
+  await quick.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Done" } });
+  const quickRun = await clock.run(quick.process());
+  assertEquals(quickRun.written, 1);
+  release();
+  const slowResult = await clock.run(slowRun);
+
+  assertEquals(slowResult.stopped, "lease_lost");
+  assertEquals(slowResult.requests, 1, "the slow worker must not retry after losing its lease");
+  assertEquals(fake.writes().length, 2);
+  assertEquals(fake.record(BASE, "Tasks", task(1))!.fields.Status, "Done");
+});
+
+Deno.test("a 429 is left to the outbox's backoff, and the time limit stops the next attempt", async () => {
+  const { clock, fake, outbox } = setup({ timeoutMs: 5_000 });
+  fake.seed(BASE, "Tasks", task(1), {});
+  fake.seed(BASE, "Projects", "recPROJ000000001", {});
+  fake.script.push(errorResponse(429, "RATE_LIMIT_REACHED", "Rate limit exceeded"));
+  await outbox.enqueue({ baseId: BASE, table: "Tasks", recordId: task(1), fields: { Status: "Done" } });
+  await outbox.enqueue({ baseId: BASE, table: "Projects", recordId: "recPROJ000000001", fields: { Name: "Q3" } });
+
+  const result = await clock.run(outbox.process({ timeLimitMs: 10_000 }));
+  assertEquals(result.requests, 1, "the client must not sit out the 429 itself");
+  assertEquals(result.retrying, 1);
+  assertEquals(result.stopped, "time_limit");
+  assertEquals(await outbox.status(), { pending: 1, retrying: 1, failed: 0 });
+  assertEquals(fake.writes().length, 1);
 });

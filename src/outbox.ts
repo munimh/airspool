@@ -99,12 +99,21 @@ export interface OutboxOptions {
    */
   backoff?: (attempt: number) => number;
   /**
-   * How long a processor's lease lasts without renewal. It is renewed before
-   * every request, so it only needs to cover one request with its retries.
-   * If a worker dies, another can take over after this long.
+   * How long a processor's lease lasts without renewal. It is renewed right
+   * before every HTTP attempt, so it only has to outlast one attempt: it
+   * must be longer than the client's `timeoutMs`. If a worker dies, another
+   * can take over after this long.
    * @default 120000
    */
   leaseMs?: number;
+  /**
+   * Retry settings for the client while the outbox sends. The outbox retries
+   * on its own schedule, so by default the client tries a failed request only
+   * once more and does not sit out 429 pauses itself; that keeps a run short
+   * and close to its time limit.
+   * @default { maxRetries: 1, maxRateLimitRetries: 0 }
+   */
+  clientRetries?: { maxRetries?: number; maxRateLimitRetries?: number };
   /** Groups (target records) loaded from the store at a time. @default 100 */
   loadSize?: number;
   /**
@@ -124,7 +133,11 @@ export interface OutboxOptions {
 
 /** Options for one {@link Outbox.process} run. */
 export interface ProcessOptions {
-  /** Stop starting new requests after this many milliseconds. */
+  /**
+   * Stop starting new HTTP attempts after this many milliseconds. The run can
+   * still last up to one attempt (the client's `timeoutMs`) and one rate-limit
+   * pause longer, so leave that much room below a hard deadline.
+   */
   timeLimitMs?: number;
 }
 
@@ -140,7 +153,7 @@ export interface ProcessResult {
   retrying: number;
   /** Changes that were given up on in this run. */
   failed: number;
-  /** HTTP requests made to Airtable. */
+  /** HTTP attempts made to Airtable, retries included. */
   requests: number;
   /** Why the run stopped before running out of due changes, if it did. */
   stopped?: "time_limit" | "lease_lost";
@@ -156,6 +169,13 @@ function newOwnerId(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
   if (c?.randomUUID) return c.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`;
+}
+
+/** Thrown from the client's beforeAttempt hook to stop a run without sending. */
+class StopRun extends Error {
+  constructor(readonly reason: "time_limit" | "lease_lost") {
+    super(reason);
+  }
 }
 
 interface Group {
@@ -211,6 +231,7 @@ export class Outbox {
   readonly #leaseMs: number;
   readonly #loadSize: number;
   readonly #keepSentMs: number;
+  readonly #clientRetries: { maxRetries: number; maxRateLimitRetries: number };
 
   /**
    * Create an outbox.
@@ -231,6 +252,16 @@ export class Outbox {
     this.#leaseMs = options.leaseMs ?? 120_000;
     this.#loadSize = options.loadSize ?? 100;
     this.#keepSentMs = options.keepSentMs ?? 7 * 24 * 3_600_000;
+    this.#clientRetries = {
+      maxRetries: options.clientRetries?.maxRetries ?? 1,
+      maxRateLimitRetries: options.clientRetries?.maxRateLimitRetries ?? 0,
+    };
+    const timeout = this.#client.timeoutMs;
+    if (timeout <= 0 || this.#leaseMs <= timeout) {
+      throw new RangeError(
+        `leaseMs (${this.#leaseMs}) must be longer than the client's timeoutMs (${timeout}), and timeoutMs must not be 0`,
+      );
+    }
   }
 
   /**
@@ -333,9 +364,22 @@ export class Outbox {
     const started = this.#clock.now();
     const now = this.#clock.now();
     if (!await this.#store.acquireLease(this.queue, owner, now + this.#leaseMs, now)) return result;
-    const renew = () => this.#store.renewLease(this.queue, owner, this.#clock.now() + this.#leaseMs);
     result.ran = true;
     const seen = new Set<string>();
+    const pastLimit = () => options.timeLimitMs !== undefined && this.#clock.now() - started >= options.timeLimitMs;
+
+    // Every HTTP attempt first checks the time limit and renews the lease, so
+    // a worker that lost its lease can never send a stale write afterwards.
+    const sender = this.#client.withOptions({
+      ...this.#clientRetries,
+      beforeAttempt: async () => {
+        if (pastLimit()) throw new StopRun("time_limit");
+        if (!await this.#store.renewLease(this.queue, owner, this.#clock.now() + this.#leaseMs)) {
+          throw new StopRun("lease_lost");
+        }
+        result.requests++;
+      },
+    });
 
     try {
       run: while (true) {
@@ -346,13 +390,13 @@ export class Outbox {
         await this.#dropSuperseded(groups);
 
         for (const batch of this.#batches(groups)) {
-          if (options.timeLimitMs !== undefined && this.#clock.now() - started >= options.timeLimitMs) {
+          if (pastLimit()) {
             result.stopped = "time_limit";
             break run;
           }
-          const lost = await this.#send(batch, renew, result);
-          if (lost) {
-            result.stopped = "lease_lost";
+          const stop = await this.#send(sender, batch, result);
+          if (stop) {
+            result.stopped = stop;
             break run;
           }
         }
@@ -436,8 +480,12 @@ export class Outbox {
     return out;
   }
 
-  /** @returns `true` if the lease was lost and the run must stop. */
-  async #send(batch: Group[], renew: () => Promise<boolean>, result: ProcessResult): Promise<boolean> {
+  /** @returns Why the run must stop, if it must. */
+  async #send(
+    sender: AirtableClient,
+    batch: Group[],
+    result: ProcessResult,
+  ): Promise<"time_limit" | "lease_lost" | undefined> {
     // A group whose fields were all superseded has nothing left to write.
     const empty = batch.filter((g) => this.#nothingToSend(g));
     for (const g of empty) {
@@ -445,12 +493,10 @@ export class Outbox {
       result.sent += g.rows.length;
     }
     const todo = batch.filter((g) => !empty.includes(g));
-    if (todo.length === 0) return false;
+    if (todo.length === 0) return undefined;
 
-    if (!await renew()) return true;
     const first = todo[0]!;
-    const table = this.#client.table(first.baseId, first.table);
-    result.requests++;
+    const table = sender.table(first.baseId, first.table);
     try {
       if (first.match) {
         const res = await table.upsert(todo.map((g) => ({ fields: g.fields })), {
@@ -467,16 +513,19 @@ export class Outbox {
         for (const g of todo) await this.#succeeded(g, result, g.recordId);
       }
     } catch (error) {
+      // Stopped before sending: the changes stay pending, untouched.
+      if (error instanceof StopRun) return error.reason;
       if (isPermanentError(error) && todo.length > 1) {
         // One bad record fails the whole request. Send each alone to find it.
         for (const g of todo) {
-          if (await this.#send([g], renew, result)) return true;
+          const stop = await this.#send(sender, [g], result);
+          if (stop) return stop;
         }
-        return false;
+        return undefined;
       }
       for (const g of todo) await this.#failedAttempt(g, error, result);
     }
-    return false;
+    return undefined;
   }
 
   #nothingToSend(g: Group): boolean {

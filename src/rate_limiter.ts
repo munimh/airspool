@@ -81,11 +81,18 @@ export class RateLimiter {
   async take(baseId: string, tokenKey: string): Promise<void> {
     const base = this.#lane(`base:${baseId}`);
     const token = this.#lane(`token:${tokenKey}`);
-    const now = this.#clock.now();
-    const start = Math.max(now, base.nextFree, base.blockedUntil, token.nextFree, token.blockedUntil);
-    base.nextFree = start + this.#baseGap;
-    token.nextFree = start + this.#tokenGap;
-    if (start > now) await this.#clock.sleep(start - now);
+    while (true) {
+      const now = this.#clock.now();
+      const start = Math.max(now, base.nextFree, base.blockedUntil, token.nextFree, token.blockedUntil);
+      base.nextFree = start + this.#baseGap;
+      token.nextFree = start + this.#tokenGap;
+      if (start <= now) return;
+      await this.#clock.sleep(start - now);
+      // A 429 may have paused the lane while we waited; if so, queue again
+      // behind the pause instead of going out during it.
+      const woke = this.#clock.now();
+      if (base.blockedUntil <= woke && token.blockedUntil <= woke) return;
+    }
   }
 
   /**
