@@ -12,8 +12,8 @@ No code changes. This release is about packaging and docs.
 
 ### Added
 
-- A publish workflow that runs on a GitHub release, runs the checks and tests, and publishes to JSR and npm with
-  provenance through GitHub OIDC, so no publish tokens are stored.
+- A publish workflow that runs on a GitHub release, runs the checks and tests, publishes to JSR and stages the npm
+  version for approval, both with provenance through GitHub OIDC, so no publish tokens are stored.
 
 ### Changed
 

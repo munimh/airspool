@@ -3,8 +3,9 @@ name: Publish
 # Runs when a GitHub release is published. Both registries authenticate with
 # this workflow's OIDC token, so no publish secrets are stored in the repo:
 # - JSR: the package must be linked to this repository in its JSR settings.
-# - npm: this workflow must be added as a trusted publisher of "airspool" on
-#   npmjs.com. npm then adds provenance on its own.
+# - npm: this workflow is a trusted publisher of "airspool" on npmjs.com, allowed
+#   to stage versions only. A staged version goes live once a maintainer approves
+#   it with 2FA, on npmjs.com or with `npm stage approve <stage-id>`.
 
 on:
   release:
@@ -62,8 +63,8 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      # Trusted publishing needs npm 11.5.1 or newer.
-      - run: npm install -g npm@^11.5.1
+      # Staged publishing needs a recent npm 11.
+      - run: npm install -g npm@^11.19.0
       - run: npm ci
       # prepublishOnly builds the package and runs the Node check first.
-      - run: npm publish --provenance --access public
+      - run: npm stage publish --provenance --access public
